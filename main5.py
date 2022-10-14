@@ -1062,11 +1062,13 @@ def train():
                 elif args.data_mode in ['rays']:
                     rays_o, rays_d, target_s, alpha_s, z_vals = trainloader.next(
                     )  # rays_o: [N_rand, 4096, 3] rays_d: [N_rand, 4096, 3] target_s: [N_rand, 4096, 3]
-                    rays_o, rays_d, target_s = rays_o.to(device), rays_d.to(
-                        device), target_s.to(device)
+                    rays_o, rays_d, target_s, alpha_s, z_vals = rays_o.to(device), rays_d.to(
+                        device), target_s.to(device), alpha_s.to(device), z_vals.to(device)
                     rays_o = rays_o.view(-1, 3)  # [N_rand*4096, 3]
                     rays_d = rays_d.view(-1, 3)  # [N_rand*4096, 3]
                     target_s = target_s.view(-1, 3)  # [N_rand*4096, 3]
+                    alpha_s = alpha_s.view(-1, 128)
+                    z_vals = z_vals.view(-1, 128)
 
                     if args.shuffle_input:
                         rays_d = rays_d.view(rays_d.shape[0], 3 // 3,
