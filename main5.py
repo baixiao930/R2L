@@ -10,10 +10,11 @@ import torch.nn as nn
 import torch.nn.functional as F
 import torch.utils.benchmark as benchmark
 
-from model.nerf_raybased import NeRF, NeRF_v3_2, PositionalEmbedder, PointSampler
+from model.nerf_raybased import NeRF, NeRF_v3_2, PositionalEmbedder, PointSampler, MYraw2outputs, raw2outputs
 from dataset.load_llff import load_llff_data
 from dataset.load_deepvoxels import load_dv_data
-from dataset.load_blender import load_blender_data, BlenderDataset, BlenderDataset_v2, get_novel_poses
+from dataset.load_blender import load_blender_data, BlenderDataset, BlenderDataset_v2, BlenderDataset_v3, get_novel_poses
+from utils.render import render_path
 from utils.ssim_torch import ssim as ssim_
 from utils.flip_loss import FLIP
 from utils.run_nerf_raybased_helpers import sample_pdf, ndc_rays, get_rays, get_embedder, get_rays_np
@@ -189,219 +190,12 @@ def render(H,
     return ret_list + [ret_dict]
 
 
-def render_path(render_poses,
-                hwf,
-                chunk,
-                render_kwargs,
-                gt_imgs=None,
-                savedir=None,
-                render_factor=0):
-    H, W, focal = hwf
-    if render_factor != 0:
-        # Render downsampled for speed
-        H = int(H / render_factor)
-        W = int(W / render_factor)
-        focal = focal / render_factor
 
-    render_kwargs['network_fn'].eval()
-    rgbs, disps, errors, ssims, psnrs = [], [], [], [], []
-
-    # for testing DONERF data
-    if args.given_render_path_rays:
-        loaded = torch.load(args.given_render_path_rays)
-        all_rays_o = loaded['all_rays_o'].to(device)  # [N, H*W, 3]
-        all_rays_d = loaded['all_rays_d'].to(device)  # [N, H*W, 3]
-        if 'gt_imgs' in loaded:
-            gt_imgs = loaded['gt_imgs'].to(device)  # [N, H, W, 3]
-        print(f'Use given render_path rays: "{args.given_render_path_rays}"')
-
-        model = render_kwargs['network_fn']
-        for i in range(len(all_rays_o)):
-            torch.cuda.synchronize()
-            t0 = time.time()
-            with torch.no_grad():
-                pts = point_sampler.sample_train(
-                    all_rays_o[i], all_rays_d[i],
-                    perturb=0)  # [H*W, n_sample*3]
-                model_input = positional_embedder(pts)
-                torch.cuda.synchronize()
-                t_input = time.time()
-                if args.learn_depth:
-                    rgbd = model(model_input)
-                    rgb = rgbd[:, :3]
-                else:
-                    rgb = model(model_input)
-                torch.cuda.synchronize()
-                t_forward = time.time()
-                print(
-                    f'[#{i}] frame, prepare input (embedding): {t_input - t0:.4f}s'
-                )
-                print(
-                    f'[#{i}] frame, model forward: {t_forward - t_input:.4f}s')
-
-                # reshape to image
-                if args.dataset_type == 'llff':
-                    H_, W_ = H, W  # non-square images
-                elif args.dataset_type == 'blender':
-                    H_ = W_ = int(math.sqrt(rgb.numel() / 3))
-                rgb = rgb.view(H_, W_, 3)
-                disp = rgb  # placeholder, to maintain compability
-
-                rgbs.append(rgb)
-                disps.append(disp)
-
-                # @mst: various metrics
-                if gt_imgs is not None:
-                    errors += [(rgb - gt_imgs[i][:H_, :W_, :]).abs()]
-                    psnrs += [mse2psnr(img2mse(rgb, gt_imgs[i, :H_, :W_]))]
-                    ssims += [ssim(rgb, gt_imgs[i, :H_, :W_])]
-
-                if savedir is not None:
-                    filename = os.path.join(savedir, '{:03d}.png'.format(i))
-                    imageio.imwrite(filename, to8b(rgbs[-1]))
-                    imageio.imwrite(filename.replace('.png', '_gt.png'),
-                                    to8b(gt_imgs[i]))  # save gt images
-                    if len(errors):
-                        imageio.imwrite(filename.replace('.png', '_error.png'),
-                                        to8b(errors[-1]))
-
-                torch.cuda.synchronize()
-                print(
-                    f'[#{i}] frame, rendering done, time for this frame: {time.time()-t0:.4f}s'
-                )
-                print('')
-    else:
-        for i, c2w in enumerate(render_poses):
-            torch.cuda.synchronize()
-            t0 = time.time()
-            print(f'[#{i}] frame, rendering begins')
-            if args.model_name in ['nerf']:
-                rgb, disp, acc, _ = render(H,
-                                           W,
-                                           focal,
-                                           chunk=chunk,
-                                           c2w=c2w[:3, :4],
-                                           **render_kwargs)
-                H_, W_ = H, W
-
-            else:  # For R2L model
-                model = render_kwargs['network_fn']
-                perturb = render_kwargs['perturb']
-
-                # Network forward
-                with torch.no_grad():
-                    if args.given_render_path_rays:  # To test DONERF data using our model
-                        pts = point_sampler.sample_train(
-                            all_rays_o[i], all_rays_d[i],
-                            perturb=0)  # [H*W, n_sample*3]
-                    else:
-                        if args.plucker:
-                            pts = point_sampler.sample_test_plucker(
-                                c2w[:3, :4])
-                        else:
-                            pts = point_sampler.sample_test(
-                                c2w[:3, :4])[0]  # [H*W, n_sample*3]
-                    model_input = positional_embedder(pts)
-                    torch.cuda.synchronize()
-                    t_input = time.time()
-                    if args.learn_depth:
-                        rgbd = model(model_input)
-                        rgb = rgbd[:, :3]
-                    else:
-                        rgb = model(model_input)
-                    torch.cuda.synchronize()
-                    t_forward = time.time()
-                    print(
-                        f'[#{i}] frame, prepare input (embedding): {t_input - t0:.4f}s'
-                    )
-                    print(
-                        f'[#{i}] frame, model forward: {t_forward - t_input:.4f}s'
-                    )
-
-                # Reshape to image
-                if args.dataset_type == 'llff':
-                    H_, W_ = H, W  # non-square images
-                elif args.dataset_type == 'blender':
-                    H_ = W_ = int(math.sqrt(rgb.numel() / 3))
-                rgb = rgb.view(H_, W_, 3)
-                disp = rgb  # Placeholder, to maintain compability
-
-            rgbs.append(rgb)
-            disps.append(disp)
-
-            # @mst: various metrics
-            if gt_imgs is not None:
-                errors += [(rgb - gt_imgs[i][:H_, :W_, :]).abs()]
-                psnrs += [mse2psnr(img2mse(rgb, gt_imgs[i, :H_, :W_]))]
-                ssims += [ssim(rgb, gt_imgs[i, :H_, :W_])]
-
-            if savedir is not None:
-                filename = os.path.join(savedir, '{:03d}.png'.format(i))
-                imageio.imwrite(filename, to8b(rgbs[-1]))
-                imageio.imwrite(filename.replace('.png', '_gt.png'),
-                                to8b(gt_imgs[i]))  # save gt images
-                if len(errors):
-                    imageio.imwrite(filename.replace('.png', '_error.png'),
-                                    to8b(errors[-1]))
-
-            torch.cuda.synchronize()
-            print(
-                f'[#{i}] frame, rendering done, time for this frame: {time.time()-t0:.4f}s'
-            )
-            print('')
-
-    rgbs = torch.stack(rgbs, dim=0)
-    disps = torch.stack(disps, dim=0)
-
-    # https://github.com/richzhang/PerceptualSimilarity
-    # LPIPS demands input shape [N, 3, H, W] and in range [-1, 1]
-    misc = {}
-    if gt_imgs is not None:
-        rec = rgbs.permute(0, 3, 1, 2)  # [N, 3, H, W]
-        ref = gt_imgs.permute(0, 3, 1, 2)  # [N, 3, H, W]
-        rescale = lambda x, ymin, ymax: (ymax - ymin) / (x.max() - x.min()) * (
-            x - x.min()) + ymin
-        rec, ref = rescale(rec, -1, 1), rescale(ref, -1, 1)
-        lpipses = []
-        mini_batch_size = 8
-        for i in np.arange(0, len(gt_imgs), mini_batch_size):
-            end = min(i + mini_batch_size, len(gt_imgs))
-            lpipses += [lpips(rec[i:end], ref[i:end])]
-        lpipses = torch.cat(lpipses, dim=0)
-
-        # -- get FLIP loss
-        # flip standard values
-        monitor_distance = 0.7
-        monitor_width = 0.7
-        monitor_resolution_x = 3840
-        pixels_per_degree = monitor_distance * (monitor_resolution_x /
-                                                monitor_width) * (np.pi / 180)
-        flips = flip.compute_flip(rec, ref,
-                                  pixels_per_degree)  # shape [N, 1, H, W]
-        # --
-
-        errors = torch.stack(errors, dim=0)
-        psnrs = torch.stack(psnrs, dim=0)
-        ssims = torch.stack(ssims, dim=0)
-        test_loss = img2mse(rgbs,
-                            gt_imgs[:, :H_, :W_])  # @mst-TODO: remove H_, W_
-
-        misc['test_loss'] = test_loss
-        misc['test_psnr'] = mse2psnr(test_loss)
-        misc['test_psnr_v2'] = psnrs.mean()
-        misc['test_ssim'] = ssims.mean()
-        misc['test_lpips'] = lpipses.mean()
-        misc['test_flip'] = flips.mean()
-        misc['errors'] = errors
-
-    render_kwargs['network_fn'].train()
-    torch.cuda.empty_cache()
-    return rgbs, disps, misc
 
 
 def render_func(model, pose):
     with torch.no_grad():
-        rgb = model(positional_embedder(point_sampler.sample_test(pose)[0]))
+        rgb = model(positional_embedder(point_sampler.sample_test(pose, False)[0])) ### add a constant argument here: no_ndc ###
     return rgb
 
 
@@ -459,6 +253,15 @@ def create_nerf(args, near, far):
         else:
             input_dim = args.n_sample_per_ray * 3 * positional_embedder.embed_dim
         model = NeRF_v3_2(args, input_dim, 3).to(device)
+        if not args.freeze_pretrained:
+            grad_vars += list(model.parameters())
+
+    elif args.model_name in ['gauss', 'nerf_gauss']:
+        if args.plucker:
+            input_dim = 6 * positional_embedder.embed_dim
+        else:
+            input_dim = args.n_sample_per_ray * 3 * positional_embedder.embed_dim
+        model = NeRF_v3_2(args, input_dim, args.N_gauss*4*3, gauss=True).to(device)
         if not args.freeze_pretrained:
             grad_vars += list(model.parameters())
 
@@ -544,7 +347,7 @@ def create_nerf(args, near, far):
         n_flops = get_n_flops_(model, input=dummy_input, count_adds=False) * (
             args.N_samples + args.N_samples + args.N_importance)
 
-    elif args.model_name in ['nerf_v3.2', 'R2L']:
+    elif args.model_name in ['nerf_v3.2', 'R2L', 'gauss', 'gauss_nerf']:
         dummy_input = torch.randn(1, model.input_dim).to(device)
         n_flops = get_n_flops_(model, input=dummy_input, count_adds=False)
 
@@ -552,74 +355,6 @@ def create_nerf(args, near, far):
         f'Model complexity per pixel: FLOPs {n_flops/1e6:.10f}M, Params {n_params/1e6:.10f}M'
     )
     return render_kwargs_train, render_kwargs_test, history, grad_vars, optimizer
-
-
-def raw2outputs(raw,
-                z_vals,
-                rays_d,
-                raw_noise_std=0,
-                white_bkgd=False,
-                pytest=False,
-                verbose=False):
-    """Transforms model's predictions to semantically meaningful values.
-    Args:
-        raw: [num_rays, num_samples along ray, 4]. Prediction from model.
-        z_vals: [num_rays, num_samples along ray]. Integration time.
-        rays_d: [num_rays, 3]. Direction of each ray.
-    Returns:
-        rgb_map: [num_rays, 3]. Estimated RGB color of a ray.
-        disp_map: [num_rays]. Disparity map. Inverse of depth map.
-        acc_map: [num_rays]. Sum of weights along each ray.
-        weights: [num_rays, num_samples]. Weights assigned to each sampled color.
-        depth_map: [num_rays]. Estimated distance to object.
-    """
-    raw2alpha = lambda raw, dists, act_fn=F.relu: 1. - torch.exp(
-        -act_fn(raw) * dists)  # @mst: opacity
-
-    dists = z_vals[..., 1:] - z_vals[..., :-1]  # dists for 'distances'
-    dists = torch.cat(
-        [dists, to_tensor([1e10]).expand(dists[..., :1].shape)],
-        -1)  # [N_rays, N_samples]
-    # @mst: 1e10 for infinite distance
-
-    dists = dists * torch.norm(rays_d[..., None, :], dim=-1)
-
-    rgb = torch.sigmoid(
-        raw[..., :3])  # [N_rays, N_samples, 3], RGB for each sampled point
-    noise = 0.
-    if raw_noise_std > 0.:
-        noise = torch.randn(raw[..., 3].shape).to(device) * raw_noise_std
-
-        # Overwrite randomly sampled data if pytest
-        if pytest:
-            np.random.seed(0)
-            noise = np.random.rand(*list(raw[..., 3].shape)) * raw_noise_std
-            noise = to_tensor(noise)
-
-    alpha = raw2alpha(raw[..., 3] + noise, dists)  # [N_rays, N_samples]
-
-    # print to check alpha
-    if verbose and global_step % args.i_print == 0:
-        for i_ray in range(0, alpha.shape[0], 100):
-            logtmp = ['%.4f' % x for x in alpha[i_ray]]
-            netprint('%4d: ' % i_ray + ' '.join(logtmp))
-
-    # weights = alpha * tf.math.cumprod(1.-alpha + 1e-10, -1, exclusive=True)
-    weights = alpha * torch.cumprod(
-        torch.cat(
-            [torch.ones((alpha.shape[0], 1)).to(device), 1. - alpha + 1e-10],
-            -1), -1)[:, :-1]  # @mst: [N_rays, N_samples]
-    rgb_map = torch.sum(weights[..., None] * rgb, -2)  # [N_rays, 3]
-
-    depth_map = torch.sum(weights * z_vals, -1)
-    disp_map = 1. / torch.max(1e-10 * torch.ones_like(depth_map).to(device),
-                              depth_map / torch.sum(weights, -1))
-    acc_map = torch.sum(weights, -1)
-
-    if white_bkgd:
-        rgb_map = rgb_map + (1. - acc_map[..., None])
-
-    return rgb_map, disp_map, acc_map, weights, depth_map
 
 
 def render_rays(ray_batch,
@@ -794,7 +529,7 @@ def get_dataloader(dataset_type, datadir, pseudo_ratio=0.5):
                 pin_memory=True,
                 sampler=InfiniteSamplerWrapper(len(trainset)))
         elif args.data_mode in ['rays']:
-            trainset = BlenderDataset_v2(
+            trainset = BlenderDataset_v3(
                 datadir,
                 dim_dir=3,
                 dim_rgb=3,
@@ -1000,6 +735,7 @@ def train():
     # Set up sampler
     global point_sampler
     point_sampler = PointSampler(H, W, focal, args.n_sample_per_ray, near, far)
+    args.near, args.far = near, far
 
     # Get train, test, video poses and images
     train_images, train_poses = images[i_train], poses[i_train]
@@ -1036,12 +772,19 @@ def train():
     if args.test_pretrained:
         print('Testing pretrained...')
         with torch.no_grad():
-            *_, misc = render_path(test_poses,
-                                   hwf,
-                                   4096,
-                                   render_kwargs_test,
-                                   gt_imgs=test_images,
-                                   render_factor=args.render_factor)
+            *_, misc = render_path(
+                args,
+                point_sampler, 
+                positional_embedder, 
+                test_poses,
+                hwf,
+                4096,
+                args.no_ndc,
+                render_kwargs_test,
+                gt_imgs=test_images,
+                render_factor=args.render_factor,
+                gauss=True
+                )
         print(
             f"Pretrained test: TestLoss {misc['test_loss'].item():.4f} TestPSNR {misc['test_psnr'].item():.4f} TestPSNRv2 {misc['test_psnr_v2'].item():.4f}"
         )
@@ -1070,13 +813,20 @@ def train():
             t_ = time.time()
             if args.render_test:
                 print('Rendering test images...')
-                rgbs, *_, misc = render_path(test_poses,
-                                             hwf,
-                                             args.chunk,
-                                             render_kwargs_test,
-                                             gt_imgs=test_images,
-                                             savedir=logger.gen_img_path,
-                                             render_factor=args.render_factor)
+                rgbs, *_, misc = render_path(
+                    args,
+                    point_sampler, 
+                    positional_embedder, 
+                    test_poses,
+                    hwf,
+                    args.chunk,
+                    args.no_ndc,
+                    render_kwargs_test,
+                    gt_imgs=test_images,
+                    savedir=logger.gen_img_path,
+                    render_factor=args.render_factor,
+                    gauss=True
+                    )
                 print(
                     f"[TEST] TestPSNR {misc['test_psnr'].item():.4f} TestPSNRv2 {misc['test_psnr_v2'].item():.4f} TestSSIM {misc['test_ssim'].item():.4f} TestLPIPS {misc['test_lpips'].item():.4f} TestFLIP {misc['test_flip'].item():.4f}"
                 )
@@ -1087,12 +837,19 @@ def train():
                 else:
                     video_poses = render_poses
                 print(f'Rendering video... (n_pose: {len(video_poses)})')
-                rgbs, *_, misc = render_path(video_poses,
-                                             hwf,
-                                             args.chunk,
-                                             render_kwargs_test,
-                                             gt_imgs=video_targets,
-                                             render_factor=args.render_factor)
+                rgbs, *_, misc = render_path(
+                    args,
+                    point_sampler, 
+                    positional_embedder, 
+                    video_poses,
+                    hwf,
+                    args.chunk,
+                    args.no_ndc,
+                    render_kwargs_test,
+                    gt_imgs=video_targets,
+                    render_factor=args.render_factor,
+                    gauss=True
+                    )
             t = time.time() - t_
         video_path = f'{logger.gen_img_path}/video_{expid}_iter{iter_}_{args.video_tag}.mp4'
         imageio.mimwrite(video_path, to8b(rgbs), fps=30, quality=8)
@@ -1110,7 +867,7 @@ def train():
         else:
             onnx_path = f'{logger.weights_path}/ckpt.onnx'
         mobile_H, mobile_W = 256, 256
-        if args.model_name in ['nerf_v3.2', 'R2L']:
+        if args.model_name in ['nerf_v3.2', 'R2L', 'gauss', 'nerf_gauss']:
             dummy_input = torch.randn(
                 1, mobile_H, mobile_W,
                 render_kwargs_test['network_fn'].input_dim).to(device)
@@ -1303,7 +1060,7 @@ def train():
                                       select_coords[:, 1]]  # (N_rand, 3)
 
                 elif args.data_mode in ['rays']:
-                    rays_o, rays_d, target_s = trainloader.next(
+                    rays_o, rays_d, target_s, alpha_s, z_vals = trainloader.next(
                     )  # rays_o: [N_rand, 4096, 3] rays_d: [N_rand, 4096, 3] target_s: [N_rand, 4096, 3]
                     rays_o, rays_d, target_s = rays_o.to(device), rays_d.to(
                         device), target_s.to(device)
@@ -1374,6 +1131,23 @@ def train():
                                                  perturb=perturb)
             rgb = model(positional_embedder(pts))
 
+        elif args.model_name in ['nerf_gauss', 'gauss']:
+            model = render_kwargs_train['network_fn']
+            perturb = render_kwargs_train['perturb']
+            if args.plucker:
+                pts = point_sampler.sample_train_plucker(rays_o, rays_d)
+            else:
+                pts = point_sampler.sample_train(rays_o,
+                                                 rays_d,
+                                                 perturb=perturb)
+            
+            ########################################################################################################################################################################################
+            if not args.no_ndc:
+                rays_o, rays_d = ndc_rays(H, W, focal, 1., rays_o, rays_d)
+            raw = model(positional_embedder(pts))
+            rgb, alpha = MYraw2outputs(i, raw, z_vals, near, far, rays_d, N_gauss=args.N_gauss)
+            ########################################################################################################################################################################################
+
         # rgb loss
         loss_rgb = img2mse(rgb[:, :3], target_s[:, :3]) * args.lw_rgb
         psnr = mse2psnr(loss_rgb)
@@ -1440,19 +1214,26 @@ def train():
                     imageio.imwrite(save_path, to8b(img))
 
         # test: using the splitted test images
-        if i % args.i_testset == 0:
+        if i % 200 == 0: #args.i_testset == 0:
             testsavedir = f'{logger.gen_img_path}/testset_{ExpID}_iter{i}'  # save the renderred test images
             os.makedirs(testsavedir, exist_ok=True)
             with torch.no_grad():
                 print(f'Iter {i} Testing...')
                 t_ = time.time()
-                *_, misc = render_path(test_poses,
-                                       hwf,
-                                       args.chunk,
-                                       render_kwargs_test,
-                                       gt_imgs=test_images,
-                                       savedir=testsavedir,
-                                       render_factor=args.render_factor)
+                *_, misc = render_path(
+                    args,
+                    point_sampler, 
+                    positional_embedder, 
+                    test_poses,
+                    hwf,
+                    args.chunk,
+                    args.no_ndc,
+                    render_kwargs_test,
+                    gt_imgs=test_images,
+                    savedir=testsavedir,
+                    render_factor=args.render_factor,
+                    gauss=True
+                    )
                 t_test = time.time() - t_
 
             # save the best model
@@ -1478,24 +1259,29 @@ TrainHistPSNR {hist_psnr:.4f} LR {new_lrate:.8f} Time {t_test:.1f}s")
                     f'Iter {i} Rendering video... (n_pose: {len(video_poses)})'
                 )
                 t_ = time.time()
-                rgbs, disps, misc = render_path(
+                rgbs, disps, misc = render_path( 
+                    args, 
+                    point_sampler, 
+                    positional_embedder, 
                     video_poses,
                     hwf,
                     args.chunk,
+                    args.no_ndc,
                     render_kwargs_test,
                     gt_imgs=video_targets,
-                    render_factor=args.render_factor)
+                    render_factor=args.render_factor,
+                    gauss=True
+                    )
                 t_video = time.time() - t_
             video_path = f'{logger.gen_img_path}/video_{ExpID}_iter{i}_{args.video_tag}.mp4'
             imageio.mimwrite(video_path, to8b(rgbs), fps=30, quality=8)
-            # disp_path = f'{logger.gen_img_path}/disp_{ExpID}_iter{i}.png'
-            # if args.model_name in [
-            #         'nerf'
-            # ]:  # @mst: raybased nerf does not predict depth right now
-            #     imageio.mimwrite(disp_path,
-            #                      to8b(disps / np.max(disps)),
-            #                      fps=30,
-            #                      quality=8)
+            if args.model_name in [
+                    'nerf'
+            ]:  # @mst: raybased nerf does not predict depth right now
+                imageio.mimwrite(disp_path,
+                                 to8b(disps / np.max(disps)),
+                                 fps=30,
+                                 quality=8)
             print(
                 f'[VIDEO] Rendering done. Time {t_video:.2f}s. Save video: "{video_path}"'
             )
@@ -1533,7 +1319,7 @@ def save_ckpt(file_name, render_kwargs_train, optimizer, best_psnr,
     if args.model_name in ['nerf'] and args.N_importance > 0:
         to_save['network_fine_state_dict'] = undataparallel(
             render_kwargs_train['network_fine'].state_dict())
-    if args.model_name in ['nerf_v3.2', 'R2L']:
+    if args.model_name in ['nerf_v3.2', 'R2L', 'gauss', 'nerf_gauss']:
         to_save['network_fn'] = undataparallel(
             render_kwargs_train['network_fn'])
     torch.save(to_save, path)

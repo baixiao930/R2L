@@ -1,0 +1,1 @@
+python utils/create_data_alpha.py --create_data rand --config configs/fern.txt --teacher_ckpt Experiments/NeRF__blender_fern*/weights/ckpt_best.tar --n_pose_kd 1000 --datadir_kd data/nerf_synthetic/fern:data/nerf_synthetic/fern_pseudo_alpha --screen --cache_ignore data,__pycache__,torchsearchsorted,imgs --project NeRF__blender_fern__alpha_pseudo

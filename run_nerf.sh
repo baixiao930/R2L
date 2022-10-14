@@ -1,0 +1,1 @@
+python main.py --model_name nerf --config configs/fern.txt --screen --cache_ignore data,__pycache__,torchsearchsorted,imgs --project NeRF__blender_fern

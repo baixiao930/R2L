@@ -31,6 +31,18 @@ parser.add_argument("--netwidth_fine",
                     type=int,
                     default=256,
                     help='channels per layer in fine network')
+parser.add_argument("--N_gauss",
+                    type=int,
+                    default=4,
+                    help='number of gaussion')
+parser.add_argument("--near",
+                    type=float,
+                    default=1.,
+                    help='ray near')
+parser.add_argument("--far",
+                    type=float,
+                    default=6.,
+                    help='ray far')
 parser.add_argument(
     "--N_rand",
     type=int,
@@ -210,7 +222,7 @@ parser.add_argument("--i_video",
 parser.add_argument('--model_name',
                     type=str,
                     default='R2L',
-                    choices=['nerf', 'nerf_v3.2', 'R2L'])
+                    choices=['nerf', 'nerf_v3.2', 'R2L', 'gauss', 'nerf_gauss'])
 parser.add_argument('--N_iters', type=int, default=200000)
 parser.add_argument('--skips', type=str, default='4')
 parser.add_argument('--D_head', type=int, default=4)
