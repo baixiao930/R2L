@@ -6,6 +6,7 @@ import torch.nn as nn
 import torch.nn.functional as F
 import numpy as np, time, math
 import pdb
+from utils.run_nerf_raybased_helpers import ndc_rays
 
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
@@ -76,7 +77,7 @@ def get_embedder(multires, i=0):
 class PointSampler():
 
     def __init__(self, H, W, focal, n_sample, near, far):
-        self.H, self.W = H, W
+        self.H, self.W, self.focal = H, W, focal
         i, j = torch.meshgrid(
             torch.linspace(0, W - 1, W).to(device),
             torch.linspace(0, H - 1, H).to(device))
@@ -91,15 +92,17 @@ class PointSampler():
         self.z_vals_test = self.z_vals[None, :].expand(
             H * W, n_sample)  # [H*W, n_sample]
 
-    def sample_test(self, c2w):  # c2w: [3, 4]
+    def sample_test(self, c2w, no_ndc=True):  # c2w: [3, 4]
         rays_d = torch.sum(
             self.dirs.unsqueeze(dim=-2) * c2w[:3, :3], dim=-1).view(
                 -1,
                 3)  # [H*W, 3] # TODO-@mst: improve this non-intuitive impl.
         rays_o = c2w[:3, -1].expand(rays_d.shape)  # [H*W, 3]
+        if not no_ndc:
+            rays_o, rays_d = ndc_rays(self.H, self.W, self.focal, 1., rays_o, rays_d)
         pts = rays_o[..., None, :] + rays_d[..., None, :] * self.z_vals_test[
             ..., :, None]  # [H*W, n_sample, 3]
-        return pts.view(pts.shape[0], -1)  # [H*W, n_sample*3]
+        return pts.view(pts.shape[0], -1), rays_d  # [H*W, n_sample*3]
 
     def sample_test2(self, c2w):  # c2w: [3, 4]
         rays_d = torch.sum(
@@ -480,7 +483,7 @@ def get_activation(act):
 class NeRF_v3_2(nn.Module):
     '''Based on NeRF_v3, move positional embedding out'''
 
-    def __init__(self, args, input_dim, output_dim):
+    def __init__(self, args, input_dim, output_dim, gauss=False):
         super(NeRF_v3_2, self).__init__()
         self.args = args
         D, W = args.netdepth, args.netwidth
@@ -536,9 +539,241 @@ class NeRF_v3_2(nn.Module):
                 *[nn.Linear(Ws[D - 2], output_dim),
                   nn.Sigmoid()])
 
+        if gauss:
+            self.tail = nn.Linear(Ws[D - 2], output_dim)
+
     def forward(self, x):  # x: embedded position coordinates
         if x.shape[-1] != self.input_dim:  # [N, C, H, W]
             x = x.permute(0, 2, 3, 1)
         x = self.head(x)
         x = self.body(x) + x if self.args.use_residual else self.body(x)
         return self.tail(x)
+
+
+def raw2outputs(raw,
+                z_vals,
+                rays_d,
+                raw_noise_std=0,
+                white_bkgd=False,
+                pytest=False,
+                verbose=False):
+    """Transforms model's predictions to semantically meaningful values.
+    Args:
+        raw: [num_rays, num_samples along ray, 4]. Prediction from model.
+        z_vals: [num_rays, num_samples along ray]. Integration time.
+        rays_d: [num_rays, 3]. Direction of each ray.
+    Returns:
+        rgb_map: [num_rays, 3]. Estimated RGB color of a ray.
+        disp_map: [num_rays]. Disparity map. Inverse of depth map.
+        acc_map: [num_rays]. Sum of weights along each ray.
+        weights: [num_rays, num_samples]. Weights assigned to each sampled color.
+        depth_map: [num_rays]. Estimated distance to object.
+    """
+    raw2alpha = lambda raw, dists, act_fn=F.relu: 1. - torch.exp(
+        -act_fn(raw) * dists)  # @mst: opacity
+
+    dists = z_vals[..., 1:] - z_vals[..., :-1]  # dists for 'distances'
+    dists = torch.cat(
+        [dists, to_tensor([1e10]).expand(dists[..., :1].shape)],
+        -1)  # [N_rays, N_samples]
+    # @mst: 1e10 for infinite distance
+
+    dists = dists * torch.norm(rays_d[..., None, :], dim=-1)
+
+    rgb = torch.sigmoid(
+        raw[..., :3])  # [N_rays, N_samples, 3], RGB for each sampled point
+    noise = 0.
+    if raw_noise_std > 0.:
+        noise = torch.randn(raw[..., 3].shape).to(device) * raw_noise_std
+
+        # Overwrite randomly sampled data if pytest
+        if pytest:
+            np.random.seed(0)
+            noise = np.random.rand(*list(raw[..., 3].shape)) * raw_noise_std
+            noise = to_tensor(noise)
+
+    alpha = raw2alpha(raw[..., 3] + noise, dists)  # [N_rays, N_samples]
+
+    # print to check alpha
+    if verbose and global_step % args.i_print == 0:
+        for i_ray in range(0, alpha.shape[0], 100):
+            logtmp = ['%.4f' % x for x in alpha[i_ray]]
+            netprint('%4d: ' % i_ray + ' '.join(logtmp))
+
+    # weights = alpha * tf.math.cumprod(1.-alpha + 1e-10, -1, exclusive=True)
+    weights = alpha * torch.cumprod(
+        torch.cat(
+            [torch.ones((alpha.shape[0], 1)).to(device), 1. - alpha + 1e-10],
+            -1), -1)[:, :-1]  # @mst: [N_rays, N_samples]
+    rgb_map = torch.sum(weights[..., None] * rgb, -2)  # [N_rays, 3]
+
+    depth_map = torch.sum(weights * z_vals, -1)
+    disp_map = 1. / torch.max(1e-10 * torch.ones_like(depth_map).to(device),
+                              depth_map / torch.sum(weights, -1))
+    acc_map = torch.sum(weights, -1)
+
+    if white_bkgd:
+        rgb_map = rgb_map + (1. - acc_map[..., None])
+
+    return rgb_map, disp_map, acc_map, weights, depth_map
+
+def gauss(idx, raw, t, num_gau, near, far, epoch):
+    """
+    raw: [N_rays, 8x12], the guass parameters
+    idx: int, the indication of rgb or sigma gauss
+    t:   [N_sample], the sampled points 
+    """
+    num_ray = raw.shape[0]
+    num_pts = t.shape[-1]
+    num_gau = num_gau
+    ratio = 1.0#(epoch / 2e3) + 1 if epoch < 2e5 else 100
+
+    raw = raw.view(raw.shape[0], num_gau, -1).unsqueeze(1).repeat(1, num_pts, 1, 1) # [N_rays, N_sample, num_gau, 12=4x3]
+    t = (t - near) / (far - near)
+    t = t.repeat(1, 1, num_gau) # [N_rays, N_sample, num_gau]
+    # norm_mu, norm_dev = (far+near)/2.0, (far-near)/2.0
+
+    # mu = raw[..., 3*idx+0]
+    mu = torch.sigmoid(raw[..., 3*idx+0])                                           # [N_rays, N_sample, num_gau]
+    # mu = 2.*(mu - 0.5)*norm_dev + norm_mu                                         
+
+    # dev = raw[..., 3*idx+1]
+    dev = torch.sigmoid(raw[..., 3*idx+1])                                          # [N_rays, N_sample, num_gau]
+    # dev = (dev * norm_dev) / ratio                                                  
+
+    inexp = -(t-mu)**2 / (2*dev**2+1e-6)                                            # [N_rays, N_sample, num_gau]
+    outexp = (2*math.pi)**0.5 * dev                                                 # [N_rays, N_sample, num_gau]
+    exp = 1 / (outexp+1e-6) * torch.exp(inexp)                                      # [N_rays, N_sample, num_gau]
+
+    exp = exp.view(-1, num_gau).unsqueeze(2)                                        # [N_rays x N_sample, num_gau, 1]
+
+    # if idx == 0:
+    #     phi = F.relu(raw[..., 3*idx+2])                                             # [N_rays, N_sample, num_gau]
+    # else:
+    #     phi = torch.sigmoid(raw[..., 3*idx+2])                                      # [N_rays, N_sample, num_gau]
+    phi = raw[..., 3*idx+2]
+    phi = phi.view(-1, num_gau).unsqueeze(1)                                        # [N_rays x N_sample, 1, num_gau]
+    res = phi.bmm(exp).squeeze().view(num_ray, num_pts)                             # [N_rays, N_sample]
+
+    return res # [N_rays, N_sample]
+
+
+def MYraw2outputs(epoch, raw, z_vals, near, far, rays_d, N_gauss, raw_noise_std=0, white_bkgd=False, pytest=False):
+    """Transforms model's predictions to semantically meaningful values.
+    Args:
+        raw: [num_rays, num_samples along ray, 4]. Prediction from model.
+        z_vals: [num_rays, num_samples along ray]. Integration time.
+        rays_d: [num_rays, 3]. Direction of each ray.
+    Returns:
+        rgb_map: [num_rays, 3]. Estimated RGB color of a ray.
+        disp_map: [num_rays]. Disparity map. Inverse of depth map.
+        acc_map: [num_rays]. Sum of weights along each ray.
+        weights: [num_rays, num_samples]. Weights assigned to each sampled color.
+        depth_map: [num_rays]. Estimated distance to object.
+    """
+
+    t = z_vals
+    num_gau = N_gauss
+    sigma_t = gauss(0, raw, t, num_gau, near, far, epoch)
+    r_t = gauss(1, raw, t, num_gau, near, far, epoch).unsqueeze(-1)
+    g_t = gauss(2, raw, t, num_gau, near, far, epoch).unsqueeze(-1)
+    b_t = gauss(3, raw, t, num_gau, near, far, epoch).unsqueeze(-1)
+    rgb = torch.cat([r_t, g_t, b_t], dim=-1)  # [N_rays, N_samples, 3]
+    rgb = torch.sigmoid(rgb)
+    # print(sigma_t.max(), sigma_t.min())
+    
+    sigma2alpha = lambda sigma, dists, act_fn=F.relu: 1.-torch.exp(-act_fn(sigma)*dists)
+
+    dists = z_vals[...,1:] - z_vals[...,:-1]
+    dists = torch.cat([dists, torch.Tensor([1e10]).cuda().expand(dists[...,:1].shape)], -1)  # [N_rays, N_samples]
+    dists = dists * torch.norm(rays_d[...,None,:], dim=-1)
+
+    noise = 0.
+    if raw_noise_std > 0.:
+        noise = torch.randn(sigma_t.shape) * raw_noise_std
+        if pytest:
+            np.random.seed(0)
+            noise = np.random.rand(*list(sigma_t.shape)) * raw_noise_std
+            noise = torch.Tensor(noise).cuda()
+
+    # noise = 1e-3
+    alpha = sigma2alpha(sigma_t + noise, dists)
+    weights = alpha * torch.cumprod(torch.cat([torch.ones((alpha.shape[0], 1)).cuda(), 1.-alpha + 1e-10], -1), -1)[:, :-1]
+    rgb_map = torch.sum(weights[...,None] * rgb, -2)  # [N_rays, 3]
+
+    # depth_map = torch.sum(weights * z_vals, -1)
+    # disp_map = 1./torch.max(1e-10 * torch.ones_like(depth_map), depth_map / torch.sum(weights, -1))
+    # acc_map = torch.sum(weights, -1)
+
+    if white_bkgd:
+        rgb_map = rgb_map + (1.-acc_map[...,None])
+
+    return rgb_map, alpha#, disp_map, acc_map, weights, depth_map, sigma_t, rgb
+
+def Teacher_raw2outputs(
+                raw,
+                z_vals,
+                rays_d,
+                raw_noise_std=0,
+                white_bkgd=False,
+                pytest=False, 
+                verbose=False):
+    """Transforms model's predictions to semantically meaningful values.
+    Args:
+        raw: [num_rays, num_samples along ray, 4]. Prediction from model.
+        z_vals: [num_rays, num_samples along ray]. Integration time.
+        rays_d: [num_rays, 3]. Direction of each ray.
+    Returns:
+        rgb_map: [num_rays, 3]. Estimated RGB color of a ray.
+        disp_map: [num_rays]. Disparity map. Inverse of depth map.
+        acc_map: [num_rays]. Sum of weights along each ray.
+        weights: [num_rays, num_samples]. Weights assigned to each sampled color.
+        depth_map: [num_rays]. Estimated distance to object.
+    """
+    raw2alpha = lambda raw, dists, act_fn=F.relu: 1. - torch.exp(
+        -act_fn(raw) * dists)  # @mst: opacity
+
+    dists = z_vals[..., 1:] - z_vals[..., :-1]  # dists for 'distances'
+    dists = torch.cat(
+        [dists, to_tensor([1e10]).expand(dists[..., :1].shape)],
+        -1)  # [N_rays, N_samples]
+    # @mst: 1e10 for infinite distance
+
+    dists = dists * torch.norm(rays_d[..., None, :], dim=-1)
+
+    rgb = torch.sigmoid(
+        raw[..., :3])  # [N_rays, N_samples, 3], RGB for each sampled point
+    noise = 0.
+    if raw_noise_std > 0.:
+        noise = torch.randn(raw[..., 3].shape).to(device) * raw_noise_std
+
+        # Overwrite randomly sampled data if pytest
+        if pytest:
+            np.random.seed(0)
+            noise = np.random.rand(*list(raw[..., 3].shape)) * raw_noise_std
+            noise = to_tensor(noise)
+
+    alpha = raw2alpha(raw[..., 3] + noise, dists)  # [N_rays, N_samples]
+
+    # print to check alpha
+    if verbose and global_step % args.i_print == 0:
+        for i_ray in range(0, alpha.shape[0], 100):
+            logtmp = ['%.4f' % x for x in alpha[i_ray]]
+            netprint('%4d: ' % i_ray + ' '.join(logtmp))
+
+    # weights = alpha * tf.math.cumprod(1.-alpha + 1e-10, -1, exclusive=True)
+    weights = alpha * torch.cumprod(
+        torch.cat(
+            [torch.ones((alpha.shape[0], 1)).to(device), 1. - alpha + 1e-10],
+            -1), -1)[:, :-1]  # @mst: [N_rays, N_samples]
+    rgb_map = torch.sum(weights[..., None] * rgb, -2)  # [N_rays, 3]
+
+    depth_map = torch.sum(weights * z_vals, -1)
+    disp_map = 1. / torch.max(1e-10 * torch.ones_like(depth_map).to(device),
+                              depth_map / torch.sum(weights, -1))
+    acc_map = torch.sum(weights, -1)
+
+    if white_bkgd:
+        rgb_map = rgb_map + (1. - acc_map[..., None])
+
+    return rgb_map, depth_map, alpha, rgb
