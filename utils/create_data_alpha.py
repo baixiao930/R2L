@@ -399,7 +399,7 @@ def raw2outputs(raw,
     if white_bkgd:
         rgb_map = rgb_map + (1. - acc_map[..., None])
 
-    return rgb_map, disp_map, acc_map, weights, depth_map
+    return rgb_map, disp_map, acc_map, weights, depth_map, alpha, rgb
 
 
 def render_rays(ray_batch,
@@ -489,7 +489,7 @@ def render_rays(ray_batch,
     #     raw = run_network(pts)
     raw = network_query_fn(pts, viewdirs, network_fn)
 
-    rgb_map, disp_map, acc_map, weights, depth_map = raw2outputs(
+    rgb_map, disp_map, acc_map, weights, depth_map, alpha_path, rgb_path = raw2outputs(
         raw,
         z_vals,
         rays_d,
@@ -520,14 +520,22 @@ def render_rays(ray_batch,
         #         raw = run_network(pts, fn=run_fn)
         raw = network_query_fn(pts, viewdirs, run_fn)
 
-        rgb_map, disp_map, acc_map, weights, depth_map = raw2outputs(
-            raw, z_vals, rays_d, raw_noise_std, white_bkgd, pytest=pytest)
+        rgb_map, disp_map, acc_map, weights, depth_map, alpha_path, rgb_path = raw2outputs(
+            raw, 
+            z_vals, 
+            rays_d, 
+            raw_noise_std, 
+            white_bkgd, 
+            pytest=pytest)
 
     ret = {
         'rgb_map': rgb_map,
         'disp_map': disp_map,
         'acc_map': acc_map,
-        'depth_map': depth_map
+        'depth_map': depth_map,
+        'alpha_path': alpha_path,
+        'rgb_path': rgb_path,
+        'z_vals': z_vals
     }
     if retraw:
         ret['raw'] = raw
@@ -808,7 +816,7 @@ def train():
         render_kwargs_.pop('teacher_fine')
 
         # run
-        i_save, split_size = 100, 4096  # every 4096 rays will make up a .npy file
+        i_save, split_size = 20, 4096  # every 4096 rays will make up a .npy file
         data, t0 = [], time.time()
         timer = Timer(args.n_pose_kd)
         for i in range(1, args.n_pose_kd + 1):
@@ -838,6 +846,12 @@ def train():
                                   dim=-1)  # [H, W, 10] or [H, W, 12]
             else:
                 data_ = torch.cat([rays_o, rays_d, rgb], dim=-1)  # [H, W, 9]
+            ########################################################################################################################################################################################
+            alpha_path = ret_dict['alpha_path']  # [H, W, 128]
+            rgb_path = ret_dict['rgb_path'].view(alpha_path.shape[0], alpha_path.shape[1], -1)  # [H, W, 128, 3]
+            z_vals = ret_dict['z_vals']
+            data_ = torch.cat([data_, alpha_path, z_vals], dim=-1)  # [H, W, 9+128*4]
+            ########################################################################################################################################################################################
             data += [data_.view(rays_o.shape[0] * rays_o.shape[1], -1)]
             print(
                 f'[{i}/{args.n_pose_kd}] Using teacher to render more images... elapsed time: {(time.time() - t0):.2f}s'
@@ -851,7 +865,7 @@ def train():
                 print(rgb.abs().mean())
 
             # save to avoid out of memory
-            if i % i_save == 0:
+            if i % 20 == 0:
                 data = torch.cat(data, dim=0)
 
                 # shuffle rays

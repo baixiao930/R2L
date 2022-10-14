@@ -426,7 +426,10 @@ def undataparallel(input):
 
 
 def get_rays_np(H, W, focal, c2w):
-    c2w, focal = to_array(c2w), to_array(focal)
+    if type(focal) == type(1.0):
+        c2w, focal = to_array(c2w), np.array(focal)
+    else:
+        c2w, focal = to_array(c2w), to_array(focal)
     i, j = np.meshgrid(np.arange(W, dtype=np.float32),
                        np.arange(H, dtype=np.float32),
                        indexing='xy')
