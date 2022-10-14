@@ -324,6 +324,84 @@ class BlenderDataset_v2(Dataset):
         return len(self.all_splits)
 
 
+class BlenderDataset_v3(Dataset):
+    r"""Load data of ray origins and directions. This is the most straightforward way.
+    """
+
+    def __init__(self,
+                 datadir,
+                 dim_dir=3,
+                 dim_rgb=3,
+                 rand_crop_size=-1,
+                 img_H=0,
+                 img_W=0,
+                 hold_ratio=0,
+                 pseudo_ratio=1.):
+        self.datadir = datadir
+        pseudo = [
+            f'{datadir}/{x}' for x in os.listdir(datadir)
+            if x.endswith('.npy') and not x.startswith('train_')
+        ]
+        original = [
+            f'{datadir}/{x}' for x in os.listdir(datadir)
+            if x.endswith('.npy') and x.startswith('train_')
+        ]
+
+        # Pick a subset of pseudo data, merge it with original data
+        assert 0 <= pseudo_ratio <= 1 or pseudo_ratio == -1
+        if pseudo_ratio == -1:  # use all the data
+            all_splits = pseudo + original
+        else:
+            original_ratio = 1. - pseudo_ratio
+            num_pseudo = int(len(original) / original_ratio) - len(original)
+            pseudo = np.random.choice(pseudo, num_pseudo).tolist()
+            all_splits = pseudo + original
+
+        # Hold some data, not used for training (for ablation study)
+        assert 0 <= hold_ratio < 1
+        if hold_ratio > 0:
+            left = int(len(all_splits) * (1 - hold_ratio))
+            all_splits = np.random.choice(all_splits, left)
+
+        self.all_splits = all_splits
+        self.dim_dir = dim_dir
+        self.dim_rgb = dim_rgb
+        self.rand_crop_size = rand_crop_size
+        self.img_H = img_H
+        self.img_W = img_W
+        print(
+            f'Load data done. #All files: {len(self.all_splits)} #Original: {len(original)} #Pseudo: {len(pseudo)}'
+        )
+
+    def _square_rand_bbox(self):
+        bbx1 = np.random.randint(0, self.img_W - self.rand_crop_size + 1)
+        bby1 = np.random.randint(0, self.img_H - self.rand_crop_size + 1)
+        return bbx1, bby1, bbx1 + self.rand_crop_size, bby1 + self.rand_crop_size
+
+    def __getitem__(self, index):
+        d = np.load(self.all_splits[index])  # [H, W, 9] or [n_ray, 9]
+        d = torch.Tensor(d)  # [H, W, 9] or [n_ray, 9]
+
+        if self.rand_crop_size > 0:
+            bbx1, bby1, bbx2, bby2 = self._square_rand_bbox()
+            d = d[bby1:bby2, bbx1:bbx2, :]
+
+        split1 = 3
+        split2 = split1 + self.dim_dir
+        split3 = split2 + self.dim_rgb
+        split4 = split3 + 128
+        split5 = split4 + 128
+
+        return d[...,       : split1], \
+               d[..., split1: split2], \
+               d[..., split2: split3], \
+               d[..., split3: split4], \
+               d[..., split4: split5]
+
+    def __len__(self):
+        return len(self.all_splits)
+
+
 def get_novel_poses(args, n_pose, theta1=-180, theta2=180, phi1=-90, phi2=0):
     '''Even-spaced sampling'''
     near, far = 2, 6
